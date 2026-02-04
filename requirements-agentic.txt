@@ -1,0 +1,13 @@
+# Agentic explainability workflow (no C3/Bedrock)
+openai>=1.0.0
+langgraph>=0.2.0
+llama-index>=0.10.0
+llama-index-embeddings-openai
+llama-index-vector-stores-simple
+gurobipy
+numpy
+python-dotenv>=1.0.0
+
+# Optional: local embeddings if OPENAI_API_KEY not set
+# langchain-community
+# sentence-transformers
