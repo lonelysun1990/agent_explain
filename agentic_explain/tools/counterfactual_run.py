@@ -13,12 +13,14 @@ import gurobipy as gp
 from gurobipy import GRB
 
 
-def _parse_constraint_expression(expr: str, model: "gp.Model") -> "gp.Constr":
+def _parse_constraint_expression(expr: str, model: "gp.Model") -> dict[str, Any]:
     """
-    Parse a simple constraint expression like 'x_ind[0,6,10] == 1' or 'd_miss[23,21] == 0'
-    and return the corresponding Gurobi constraint (to be added).
+    Parse a simple constraint expression like 'x_ind[0,6,10] == 1' or 'd_miss[23,21] == 0',
+    add it to the model, and return a debug dict with details.
 
-    Returns the Constr object after model.addConstr(...).
+    Returns
+    -------
+    dict with: expr, gurobi_var_name, forced_value, baseline_value, constraint_name
     """
     expr = expr.strip()
     # Match: var_name[i,j,k] == value  or  var_name[i, j, k] == value
@@ -33,9 +35,27 @@ def _parse_constraint_expression(expr: str, model: "gp.Model") -> "gp.Constr":
     gurobi_var_name = f"{var_name}[{','.join(map(str, indices))}]"
     var = model.getVarByName(gurobi_var_name)
     if var is None:
+        # Fallback: Gurobi may not have name index until model.update(); search by VarName
+        for v in model.getVars():
+            if v.VarName == gurobi_var_name:
+                var = v
+                break
+    if var is None:
         raise ValueError(f"Variable not found in model: {gurobi_var_name}")
 
-    return model.addConstr(var == value, name=f"user_constr_{var_name}_{'_'.join(map(str, indices))}")
+    # Capture the variable's current bounds/start for debug context
+    constr_name = f"user_constr_{var_name}_{'_'.join(map(str, indices))}"
+    model.addConstr(var == value, name=constr_name)
+
+    return {
+        "expr": expr,
+        "gurobi_var_name": gurobi_var_name,
+        "forced_value": value,
+        "var_lb": var.LB,
+        "var_ub": var.UB,
+        "var_type": var.VType,
+        "constraint_name": constr_name,
+    }
 
 
 def run_counterfactual(
@@ -68,12 +88,13 @@ def run_counterfactual(
         ilp_path: str or None (if infeasible and written)
         error: str (if status == "error")
     """
-    result = {
+    result: dict[str, Any] = {
         "status": "error",
         "objective_value": None,
         "decision_variables": {},
         "ilp_path": None,
         "error": None,
+        "applied_constraints": [],  # debug: details of each constraint added
     }
 
     try:
@@ -82,9 +103,13 @@ def run_counterfactual(
         result["error"] = str(e)
         return result
 
+    # Ensure variable names are available for getVarByName (required by some Gurobi builds).
+    model.update()
+
     try:
         for expr in constraint_expressions:
-            _parse_constraint_expression(expr, model)
+            info = _parse_constraint_expression(expr, model)
+            result["applied_constraints"].append(info)
     except Exception as e:
         result["error"] = f"Failed to add constraint: {e}"
         return result
@@ -96,6 +121,14 @@ def run_counterfactual(
         result["status"] = "feasible"
         result["objective_value"] = model.ObjVal
         result["decision_variables"] = {v.VarName: v.X for v in model.getVars()}
+        # Compute objective breakdown using the solved variables
+        try:
+            from use_case.staffing_model import compute_objective_breakdown
+            result["objective_breakdown"] = compute_objective_breakdown(
+                result["decision_variables"], inputs
+            )
+        except Exception as e:
+            result["objective_breakdown"] = {"error": str(e)}
         return result
 
     if model.status == GRB.INFEASIBLE:

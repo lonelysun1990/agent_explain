@@ -2,12 +2,20 @@
 Staffing optimization model: Gurobi formulation and data loading.
 
 This module is the canonical .py source for the staffing optimization model.
-It can be replaced by your own implementation; the agentic workflow expects
-build_gurobi_model(inputs, env_kwargs) and load_raw_data(data_dir).
+Data paths are relative to the caller; typically use_case/staffing_model/data and
+outputs under use_case/staffing_model/outputs.
 """
+from __future__ import annotations
 
-# Structured formulation documentation for RAG. Sections use names that match
-# model variables and constraint name patterns (x, x_ind, d_miss, demand_balance, etc.).
+import json
+from pathlib import Path
+from typing import Any
+
+import gurobipy as gp
+from gurobipy import GRB
+import numpy as np
+
+# Import FORMULATION_DOCS from self (defined below)
 FORMULATION_DOCS = r"""
 ## PROBLEM_OVERVIEW
 Name: Staffing Optimization.
@@ -118,16 +126,6 @@ Sum over j,d of x_p_ind[j,d] * project_cohort_penalty[j,d]. Penalizes assigning 
 Variables: x_p_ind.
 """
 
-from __future__ import annotations
-
-import json
-from pathlib import Path
-from typing import Any
-
-import gurobipy as gp
-from gurobipy import GRB
-import numpy as np
-
 
 # -------- Data structures --------
 
@@ -157,7 +155,7 @@ class DotDict(dict):
 # -------- Data loading --------
 
 def load_raw_data(data_dir: str | Path) -> dict[str, Any]:
-    """Load raw data from JSON and txt files in data_dir (Option 2 style)."""
+    """Load raw data from JSON and txt files in data_dir."""
     data_dir = Path(data_dir)
     with open(data_dir / "fte_mapping.json", "r", encoding="utf-8") as f:
         fte_mapping = json.load(f)
@@ -278,26 +276,12 @@ def process_data(
 # -------- Model building --------
 
 def build_gurobi_model(inputs: dict, env_kwargs: dict | None = None):
-    """
-    Build the staffing optimization Gurobi model.
-
-    Parameters
-    ----------
-    inputs : dict
-        Processed data from process_data().
-    env_kwargs : dict, optional
-        Passed to gp.Env(). If None or empty, gp.Env() uses default (env vars like GRB_LICENSE_FILE).
-
-    Returns
-    -------
-    model : gurobipy.Model
-    """
+    """Build the staffing optimization Gurobi model."""
     inputs = DotDict(inputs)
     env_kwargs = env_kwargs or {}
     env = gp.Env(**env_kwargs)
     model = gp.Model(name="Staffing_Optimization", env=env)
 
-    # Decision variables
     x = model.addVars(
         inputs.n_employees,
         inputs.horizon,
@@ -329,7 +313,6 @@ def build_gurobi_model(inputs: dict, env_kwargs: dict | None = None):
         name="x_idle",
     )
 
-    # Objectives
     obj1 = gp.quicksum(
         inputs.C_miss[d, t] * d_miss[t, d] for t in inputs.T for d in inputs.D
     )
@@ -342,7 +325,6 @@ def build_gurobi_model(inputs: dict, env_kwargs: dict | None = None):
     )
     model.setObjective(obj1 + obj2 + obj3 + obj4, GRB.MINIMIZE)
 
-    # Constraints
     for t in inputs.T:
         for d in inputs.D:
             model.addConstr(
@@ -409,3 +391,68 @@ def build_gurobi_model(inputs: dict, env_kwargs: dict | None = None):
         )
 
     return model
+
+
+def compute_objective_breakdown(
+    decision_variables: dict[str, float],
+    inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Compute the four objective terms from a flat decision-variable dict."""
+    grouped: dict[str, dict[tuple[int, ...], float]] = {}
+    for key, value in decision_variables.items():
+        bracket = key.index("[")
+        var_name = key[:bracket]
+        idx_str = key[bracket + 1 : -1]
+        indices = tuple(int(i) for i in idx_str.split(","))
+        grouped.setdefault(var_name, {})[indices] = value
+
+    def _to_array(name: str) -> np.ndarray:
+        data = grouped.get(name, {})
+        if not data:
+            return np.array([])
+        shape = tuple(max(idx[dim] for idx in data) + 1 for dim in range(len(next(iter(data)))))
+        arr = np.zeros(shape)
+        for idx, val in data.items():
+            arr[idx] = val
+        return arr
+
+    d_miss_arr = _to_array("d_miss")
+    x_idle_arr = _to_array("x_idle")
+    x_p_ind_arr = _to_array("x_p_ind")
+
+    C_miss = np.array(inputs["C_miss"])
+    cohort_pen = np.array(inputs["project_cohort_penalty"])
+
+    obj1 = float(np.sum(C_miss * d_miss_arr.T))
+    obj2 = float(np.sum(x_idle_arr))
+    obj3 = float(np.sum(x_p_ind_arr))
+    obj4 = float(np.sum(x_p_ind_arr * cohort_pen))
+    total = obj1 + obj2 + obj3 + obj4
+
+    terms = {
+        "cost_of_missing_demand": {
+            "value": obj1,
+            "description": "Weighted sum of unmet staffing demand across all projects and weeks",
+            "formula": "sum_t,d C_miss[d,t] * d_miss[t,d]",
+        },
+        "idle_time": {
+            "value": obj2,
+            "description": "Total employee idle time (FTE-weeks not assigned to any project)",
+            "formula": "sum_j,t x_idle[j,t]",
+        },
+        "staffing_consistency": {
+            "value": obj3,
+            "description": "Number of unique employee-project pairings (fewer = less context switching)",
+            "formula": "sum_j,d x_p_ind[j,d]",
+        },
+        "out_of_cohort_penalty": {
+            "value": obj4,
+            "description": "Penalty for assigning employees to projects outside their preferred cohort",
+            "formula": "sum_j,d x_p_ind[j,d] * cohort_penalty[j,d]",
+        },
+    }
+
+    return {
+        "terms": terms,
+        "total": total,
+    }

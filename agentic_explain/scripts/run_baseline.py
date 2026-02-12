@@ -17,7 +17,9 @@ if str(_project_root) not in sys.path:
 from gurobipy import GRB
 
 from config.load_secrets import get_gurobi_env_kwargs
-from agentic_explain.staffing_model import (
+from use_case.staffing_model import (
+    STAFFING_DATA_DIR,
+    STAFFING_OUTPUTS_DIR,
     load_raw_data,
     process_data,
     build_gurobi_model,
@@ -25,12 +27,12 @@ from agentic_explain.staffing_model import (
 
 
 def main(
-    data_dir: str | Path = "data",
-    outputs_dir: str | Path = "outputs",
+    data_dir: str | Path | None = None,
+    outputs_dir: str | Path | None = None,
     time_limit: int = 100,
 ) -> None:
-    data_dir = Path(data_dir)
-    outputs_dir = Path(outputs_dir)
+    data_dir = Path(data_dir if data_dir is not None else STAFFING_DATA_DIR)
+    outputs_dir = Path(outputs_dir if outputs_dir is not None else STAFFING_OUTPUTS_DIR)
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
     raw = load_raw_data(data_dir)
@@ -72,8 +74,8 @@ def main(
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--data-dir", default="data")
-    p.add_argument("--outputs-dir", default="outputs")
+    p.add_argument("--data-dir", default=None, help="Default: use_case/staffing_model/data")
+    p.add_argument("--outputs-dir", default=None, help="Default: use_case/staffing_model/outputs")
     p.add_argument("--time-limit", type=int, default=100)
     args = p.parse_args()
-    main(data_dir=args.data_dir, outputs_dir=args.outputs_dir, time_limit=args.time_limit)
+    main(data_dir=args.data_dir or STAFFING_DATA_DIR, outputs_dir=args.outputs_dir or STAFFING_OUTPUTS_DIR, time_limit=args.time_limit)

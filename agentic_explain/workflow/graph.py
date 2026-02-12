@@ -16,7 +16,7 @@ from agentic_explain.workflow import nodes
 def create_workflow(
     *,
     openai_client: Any,
-    rag_index: Any,
+    rag_strategy: Any,
     baseline_result: dict[str, Any],
     data_dir: str,
     build_model_fn: Callable,
@@ -30,7 +30,7 @@ def create_workflow(
     Parameters
     ----------
     openai_client : openai.OpenAI() (or compatible)
-    rag_index : LlamaIndex VectorStoreIndex
+    rag_strategy : RAGStrategy (plain_rag, graph_rag, or no_rag)
     baseline_result : dict with objective_value, decision_variables
     data_dir : path to data folder (ds_list.json, project_list.json)
     build_model_fn : (inputs, env_kwargs) -> Gurobi model
@@ -42,16 +42,19 @@ def create_workflow(
     -------
     compiled LangGraph
     """
-    variable_names = ["x", "x_ind", "x_p_ind", "d_miss", "x_idle"]
+    # Extract variable families from the baseline solution (no hardcoded names)
+    variable_names = sorted(set(
+        k.split("[")[0] for k in baseline_result.get("decision_variables", {})
+    ))
 
     def _query_node(s):
         return nodes.make_query_node()(s, openai_client=openai_client)
 
     entity_n = nodes.make_entity_resolution_node(data_dir)
-    constraint_n = nodes.make_constraint_generation_node(rag_index, openai_client, variable_names)
+    constraint_n = nodes.make_constraint_generation_node(rag_strategy, openai_client, variable_names)
     counterfactual_n = nodes.make_counterfactual_run_node(build_model_fn, inputs, env_kwargs, outputs_dir)
-    compare_n = nodes.make_compare_node()
-    ilp_n = nodes.make_ilp_analysis_node(rag_index, openai_client)
+    compare_n = nodes.make_compare_node(inputs, variable_names, outputs_dir)
+    ilp_n = nodes.make_ilp_analysis_node(rag_strategy, openai_client)
     summarize_n = nodes.make_summarize_node(openai_client)
 
     graph = StateGraph(AgentState)
@@ -91,14 +94,13 @@ def invoke_workflow(
     user_query: str,
     *,
     baseline_result: dict[str, Any],
-    rag_index: Any,
 ) -> dict[str, Any]:
     """Run the workflow and return the final state."""
     config = {"configurable": {"thread_id": "default"}}
+    # RAG strategy is in node closures, not state (not serializable).
     initial: AgentState = {
         "user_query": user_query,
         "baseline_result": baseline_result,
-        "rag_index": rag_index,
     }
     final = workflow.invoke(initial, config=config)
     return final

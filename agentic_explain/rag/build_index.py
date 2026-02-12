@@ -58,6 +58,30 @@ def build_index_mapping_doc(data_dir: str | Path) -> Document:
     )
 
 
+def collect_raw_chunks(
+    py_path: str | Path,
+    lp_path: str | Path | None = None,
+    mps_path: str | Path | None = None,
+    data_dir: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Collect all raw chunks (before embedding) from all sources.
+
+    Returns a flat list of dicts: { "text": str, "metadata": { "source": ..., "section": ..., ... } }
+    Useful for inspecting what goes into the RAG index.
+    """
+    chunks: list[dict[str, Any]] = []
+    chunks.extend(parse_py_formulation(py_path))
+    if lp_path and Path(lp_path).exists():
+        chunks.extend(parse_lp_file(lp_path))
+    if mps_path and Path(mps_path).exists():
+        chunks.extend(parse_mps_file(mps_path))
+    if data_dir and Path(data_dir).exists():
+        doc = build_index_mapping_doc(data_dir)
+        chunks.append({"text": doc.text, "metadata": doc.metadata})
+    return chunks
+
+
 def build_rag_index(
     py_path: str | Path,
     lp_path: str | Path | None = None,
@@ -134,6 +158,14 @@ def build_rag_index(
         documents, embed_model=embed, storage_context=storage_context
     )
     index.storage_context.persist(persist_dir=str(persist_path))
+
+    # Re-write docstore and index_store with indentation for human readability.
+    # Skip default__vector_store.json (too large — pretty-printing would 3-4x the size).
+    for fname in ("docstore.json", "index_store.json"):
+        fpath = persist_path / fname
+        if fpath.exists():
+            data = json.loads(fpath.read_text(encoding="utf-8"))
+            fpath.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
     return index
 

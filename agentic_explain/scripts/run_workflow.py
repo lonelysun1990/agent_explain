@@ -4,10 +4,10 @@ Prerequisites: baseline run and RAG index already built.
 
   python -m agentic_explain.scripts.run_workflow "Why was Josh not staffed on Ipp IO Pilot in week 6?"
 
-Expects from project root:
-  - config/secrets.env (or secrets.env) with OPENAI_API_KEY and GUROBI_LICENSE_FILE
-  - outputs/baseline_result.json (from run_baseline)
-  - outputs/rag_index/ (from build_rag_index)
+Expects:
+  - config/secrets.env with OPENAI_API_KEY and GUROBI_LICENSE_FILE
+  - use_case/staffing_model/outputs/baseline_result.json (from run_baseline)
+  - use_case/staffing_model/outputs/rag_index/ (from build_rag_index)
 """
 
 from __future__ import annotations
@@ -23,20 +23,26 @@ if str(_project_root) not in sys.path:
 from config.load_secrets import load_secrets, get_gurobi_env_kwargs
 from openai import OpenAI
 
-from agentic_explain.staffing_model import load_raw_data, process_data, build_gurobi_model
-from agentic_explain.rag.build_index import load_rag_index
+from use_case.staffing_model import (
+    STAFFING_DATA_DIR,
+    STAFFING_OUTPUTS_DIR,
+    load_raw_data,
+    process_data,
+    build_gurobi_model,
+)
+from agentic_explain.rag.plain_rag import build_plain_rag
 from agentic_explain.workflow.graph import create_workflow, invoke_workflow
 
 
 def main(
     user_query: str,
     *,
-    data_dir: str | Path = "data",
-    outputs_dir: str | Path = "outputs",
+    data_dir: str | Path | None = None,
+    outputs_dir: str | Path | None = None,
 ) -> None:
     load_secrets()
-    outputs_dir = Path(outputs_dir)
-    data_dir = Path(data_dir)
+    data_dir = Path(data_dir if data_dir is not None else STAFFING_DATA_DIR)
+    outputs_dir = Path(outputs_dir if outputs_dir is not None else STAFFING_OUTPUTS_DIR)
 
     baseline_path = outputs_dir / "baseline_result.json"
     if not baseline_path.exists():
@@ -46,10 +52,12 @@ def main(
         baseline_result = json.load(f)
 
     rag_dir = outputs_dir / "rag_index"
-    if not rag_dir.exists():
-        print("Build RAG index first (e.g. run build_rag_index). Expected at", rag_dir)
-        sys.exit(1)
-    rag_index = load_rag_index(persist_dir=rag_dir)
+    py_path = _project_root / "use_case" / "staffing_model" / "staffing_model.py"
+    lp_path = outputs_dir / "model.lp"
+    mps_path = outputs_dir / "model.mps"
+    rag_strategy = build_plain_rag(
+        py_path, lp_path=lp_path, mps_path=mps_path, data_dir=data_dir, persist_dir=rag_dir
+    )
 
     raw = load_raw_data(data_dir)
     inputs = process_data(
@@ -65,7 +73,7 @@ def main(
 
     workflow = create_workflow(
         openai_client=openai_client,
-        rag_index=rag_index,
+        rag_strategy=rag_strategy,
         baseline_result=baseline_result,
         data_dir=str(data_dir),
         build_model_fn=build_gurobi_model,
@@ -78,7 +86,6 @@ def main(
         workflow,
         user_query,
         baseline_result=baseline_result,
-        rag_index=rag_index,
     )
 
     print("\n--- Summary ---\n")
@@ -89,7 +96,7 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description="Run agentic explainability workflow")
     p.add_argument("query", nargs="?", default="Why was Josh not staffed on Ipp IO Pilot in week 6?")
-    p.add_argument("--data-dir", default="data")
-    p.add_argument("--outputs-dir", default="outputs")
+    p.add_argument("--data-dir", default=None, help="Default: use_case/staffing_model/data")
+    p.add_argument("--outputs-dir", default=None, help="Default: use_case/staffing_model/outputs")
     args = p.parse_args()
     main(args.query, data_dir=args.data_dir, outputs_dir=args.outputs_dir)

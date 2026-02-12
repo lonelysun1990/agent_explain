@@ -16,4 +16,6 @@ class AgentState(TypedDict, total=False):
     conflict_explanation: str
     final_summary: str
     retry_count: int
-    rag_index: Any
+    # --- Debug / visibility fields ---
+    rag_retrieval_debug: dict[str, Any]  # chunks, scores, query used for retrieval
+    llm_messages_debug: dict[str, Any]   # system + user messages sent to each LLM call
