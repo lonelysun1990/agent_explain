@@ -6,7 +6,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from agentic_explain.evaluation.run_storage import (
+    create_run_dir,
+    get_completed_tasks,
+    save_result,
+    write_run_dir_metadata,
+)
 
 
 def load_eval_queries(path: str | Path) -> list[dict[str, Any]]:
@@ -85,3 +92,106 @@ def run_batch_evaluation(
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, default=str)
     return results
+
+
+def run_batch_multi_strategy(
+    create_workflow_fn: Callable[..., Any],
+    strategies: dict[str, Any],
+    queries: list[dict[str, Any]],
+    baseline_result: dict[str, Any],
+    outputs_dir: str | Path,
+    *,
+    run_dir: Path | None = None,
+    resume: bool = False,
+    openai_client: Any = None,
+    data_dir: str = "",
+    build_model_fn: Callable | None = None,
+    inputs: dict | None = None,
+    env_kwargs: dict | None = None,
+    temperature: float = 0,
+) -> Path:
+    """
+    Run all (strategy x query) combinations, save each result to run_dir.
+    Progress: prints which strategy/query finished, failed, or was skipped (resume).
+
+    Parameters
+    ----------
+    create_workflow_fn : callable that returns a workflow (e.g. create_workflow from graph)
+    strategies : dict name -> rag_strategy
+    queries : list of query dicts (query, expected_path, expected_constraint_expr, etc.)
+    baseline_result : baseline result dict
+    outputs_dir : parent for runs (e.g. OUTPUTS_DIR)
+    run_dir : if None, create new run dir; if Path and resume=True, skip existing files
+    resume : if True and run_dir has existing result files, skip those (strategy, query_index)
+    openai_client, data_dir, build_model_fn, inputs, env_kwargs, temperature : passed to create_workflow_fn
+
+    Returns
+    -------
+    Path to the run directory.
+    """
+    from agentic_explain.workflow.graph import invoke_workflow
+
+    outputs_dir = Path(outputs_dir)
+    if run_dir is None:
+        run_dir = create_run_dir(outputs_dir)
+        resume = False
+    else:
+        run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    strategy_names = list(strategies.keys())
+    completed = get_completed_tasks(run_dir, strategy_names, len(queries)) if resume else set()
+    if resume and completed:
+        print(f"Resume: skipping {len(completed)} already-completed (strategy, query_index) pairs.")
+
+    write_run_dir_metadata(run_dir, {
+        "strategies": strategy_names,
+        "query_count": len(queries),
+        "resume": resume,
+    })
+
+    total = len(strategy_names) * len(queries)
+    done = 0
+    failed: list[tuple[str, int, str]] = []  # (strategy, query_index, error_msg)
+
+    for sname in strategy_names:
+        strategy = strategies[sname]
+        workflow = create_workflow_fn(
+            openai_client=openai_client,
+            rag_strategy=strategy,
+            baseline_result=baseline_result,
+            data_dir=data_dir,
+            build_model_fn=build_model_fn,
+            inputs=inputs or {},
+            env_kwargs=env_kwargs or {},
+            outputs_dir=str(outputs_dir),
+            temperature=temperature,
+        )
+        for qi, q in enumerate(queries):
+            if (sname, qi) in completed:
+                print(f"  [skip] {sname} query {qi} (already done)")
+                done += 1
+                continue
+            query_text = q.get("query", "")
+            try:
+                state = invoke_workflow(workflow, query_text, baseline_result=baseline_result)
+                save_result(
+                    run_dir, sname, qi, state,
+                    query_meta={
+                        "query": query_text,
+                        "query_id": q.get("id"),
+                        "expected_path": q.get("expected_path"),
+                        "expected_constraint_expr": q.get("expected_constraint_expr"),
+                        "reference_answer": q.get("reference_answer"),
+                    },
+                )
+                done += 1
+                status = state.get("counterfactual_status", "?")
+                print(f"  [ok] {sname} query {qi} -> {status} ({done}/{total})")
+            except Exception as e:
+                failed.append((sname, qi, str(e)))
+                print(f"  [FAIL] {sname} query {qi}: {e}")
+    if failed:
+        print(f"\nFailed: {len(failed)} — {failed}")
+    print(f"Run dir: {run_dir}")
+    return run_dir

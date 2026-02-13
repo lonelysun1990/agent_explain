@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from agentic_explain.workflow.state import AgentState
 
 
-def make_query_node():
+def make_query_node(temperature: float = 0):
     def query_node(state: "AgentState", *, openai_client) -> "AgentState":
         user_query = state.get("user_query", "")
         if not user_query:
@@ -29,6 +29,7 @@ def make_query_node():
             model="gpt-4o-mini",
             messages=[{"role": "system", "content": sys}, {"role": "user", "content": user_query}],
             max_tokens=200,
+            temperature=temperature,
         )
         reformulated = (r.choices[0].message.content or "").strip()
         state["reformulated_query"] = reformulated or user_query
@@ -70,7 +71,7 @@ def make_entity_resolution_node(data_dir: str | Path):
     return entity_resolution_node
 
 
-def make_constraint_generation_node(rag_strategy, openai_client, variable_names: list[str]):
+def make_constraint_generation_node(rag_strategy, openai_client, variable_names: list[str], temperature: float = 0):
     def constraint_generation_node(state: "AgentState") -> "AgentState":
         query = state.get("reformulated_query", "")
         if not query:
@@ -105,8 +106,10 @@ def make_constraint_generation_node(rag_strategy, openai_client, variable_names:
         sys_msg = (
             f"You translate a user request into one or more constraint expressions for a Gurobi optimization model. "
             f"Available decision variables (use exact names): {vars_str}. "
-            f"Format: variable_name[index1,index2,...] == value (integer indices, no spaces in brackets). "
-            f"Example format: {examples_str}. "
+            f"Format: variable_name[index1,index2,...] == value or >= value or <= value. "
+            f"Value can be a number (e.g. 0, 1) or a data parameter (e.g. D[t,d] for demand). "
+            f"You may use a single variable or a sum of variables (e.g. x[j,t,d] + x[j+1,t,d] + ... >= D[d,t]). "
+            f"Example format: {examples_str}. For 'force no unmet demand': d_miss[t,d] == 0. "
             f"Use the RAG context below to understand variable dimensions and index meanings. "
             f"Output only the constraint line(s), one per line, no explanation."
         )
@@ -118,6 +121,7 @@ def make_constraint_generation_node(rag_strategy, openai_client, variable_names:
                 {"role": "user", "content": user_msg},
             ],
             max_tokens=300,
+            temperature=temperature,
         )
         raw = (r.choices[0].message.content or "").strip()
 
@@ -130,8 +134,110 @@ def make_constraint_generation_node(rag_strategy, openai_client, variable_names:
         }
         state["llm_messages_debug"] = llm_debug
 
-        exprs = re.findall(r"\w+\s*\[\s*[^\]]+\s*\]\s*==\s*[\d.]+", raw)
-        valid = [e for e in exprs if e.split("[")[0].strip() in variable_names]
+        # --- Parse constraint expressions from LLM output ---
+        # Accept: (1) single variable[indices] == number or == param[indices];
+        #         (2) single variable >=/<= number or param[indices];
+        #         (3) sum of variables >=/==/<= number or param[indices] (data params treated like numbers).
+        def _parse_exprs(text: str) -> list[str]:
+            results: list[str] = []
+            for line in text.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                # Linear (sum) first: full line "term + term + ... op value"
+                if "+" in line and any(op in line for op in (">=", "<=", "==")):
+                    m = re.match(r"^(.+?)\s*(>=|<=|==)\s*([\d.]+|\w+\s*\[\s*[^\]]+\s*\])\s*$", line)
+                    if m:
+                        lhs = m.group(1)
+                        terms = re.findall(r"(\w+)\s*\[\s*[^\]]+\s*\]", lhs)
+                        if terms and all(t in variable_names for t in terms):
+                            results.append(line)
+                            continue
+                # Simple: single var op number or param
+                for pat in (
+                    r"\w+\s*\[\s*[^\]]+\s*\]\s*==\s*[\d.]+",
+                    r"\w+\s*\[\s*[^\]]+\s*\]\s*=\s*[\d.]+",
+                    r"\w+\s*\[\s*[^\]]+\s*\]\s*[<>]=?\s*[\d.]+",
+                    r"\w+\s*\[\s*[^\]]+\s*\]\s*==\s*\w+\s*\[\s*[^\]]+\s*\]",
+                    r"\w+\s*\[\s*[^\]]+\s*\]\s*[<>]=?\s*\w+\s*\[\s*[^\]]+\s*\]",
+                ):
+                    for m in re.finditer(pat, line):
+                        e = m.group(0)
+                        if "=" in pat and "==" not in e and re.search(r"=\s*[\d.]", e):
+                            e = re.sub(r"(?<!=)=(?!=)", "==", e)
+                        results.append(e)
+            return list(dict.fromkeys(results))
+
+        exprs = _parse_exprs(raw)
+
+        def _expr_uses_valid_vars(expr: str) -> bool:
+            """True if every variable on the LHS is in variable_names (RHS can be number or param)."""
+            for op in ("==", ">=", "<="):
+                if op in expr:
+                    lhs = expr.split(op)[0]
+                    break
+            else:
+                return False
+            for m in re.finditer(r"(\w+)\s*\[", lhs):
+                if m.group(1) not in variable_names:
+                    return False
+            return True
+
+        valid = [e for e in exprs if _expr_uses_valid_vars(e)]
+        rejected = [e for e in exprs if e not in valid]
+
+        # --- Retry if no valid expressions found ---
+        retry_raw = None
+        if not valid and raw:
+            retry_prompt = (
+                f"Your previous response was:\n{raw}\n\n"
+                f"Rewrite as one or more constraints we can parse. "
+                f"Use: variable_name[indices] == or >= or <= number or data parameter (e.g. D[d,t]). "
+                f"Or a sum of variables: e.g. x[8,0,10] + x[8,1,10] + ... >= D[8,10]. "
+                f"Available variables: {vars_str}. Output only the constraint line(s), one per line."
+            )
+            r2 = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": sys_msg},
+                    {"role": "user", "content": user_msg},
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": retry_prompt},
+                ],
+                max_tokens=300,
+                temperature=temperature,
+            )
+            retry_raw = (r2.choices[0].message.content or "").strip()
+            exprs_retry = _parse_exprs(retry_raw)
+            valid_retry = [e for e in exprs_retry if e.split("[")[0].strip() in variable_names]
+            rejected_retry = [e for e in exprs_retry if e.split("[")[0].strip() not in variable_names]
+            if valid_retry:
+                exprs = exprs_retry
+                valid = valid_retry
+                rejected = rejected_retry
+
+        # --- Capture constraint parsing debug ---
+        parsing_debug: dict = {
+            "raw_response": raw,
+            "regex_matches_attempt1": _parse_exprs(raw),
+            "valid_expressions": valid,
+            "rejected_expressions": rejected,
+            "rejected_reason": (
+                f"variable name not in {variable_names}" if rejected else None
+            ),
+        }
+        if retry_raw is not None:
+            parsing_debug["retry_raw_response"] = retry_raw
+            parsing_debug["regex_matches_retry"] = _parse_exprs(retry_raw)
+        # Check if LLM produced something the regex couldn't parse at all
+        if not valid and raw:
+            parsing_debug["parse_failure"] = (
+                "Regex found no valid constraints. We accept: single var or sum of vars, "
+                "with ==/>=/<= and numeric or data-parameter RHS (e.g. D[8,10])."
+            )
+        llm_debug["constraint_generation"]["parsing"] = parsing_debug
+        state["llm_messages_debug"] = llm_debug
+
         state["constraint_expressions"] = valid
         return state
     return constraint_generation_node
@@ -217,7 +323,7 @@ def make_compare_node(inputs: dict, variable_names: list[str], outputs_dir: str 
     return compare_node
 
 
-def make_ilp_analysis_node(rag_strategy, openai_client):
+def make_ilp_analysis_node(rag_strategy, openai_client, temperature: float = 0):
     import agentic_explain.rag.ilp_parser as _ilp_module
 
     def ilp_analysis_node(state: "AgentState") -> "AgentState":
@@ -264,6 +370,7 @@ def make_ilp_analysis_node(rag_strategy, openai_client):
                 {"role": "user", "content": user_msg},
             ],
             max_tokens=250,
+            temperature=temperature,
         )
 
         # --- Capture LLM messages debug ---
@@ -280,7 +387,7 @@ def make_ilp_analysis_node(rag_strategy, openai_client):
     return ilp_analysis_node
 
 
-def make_summarize_node(openai_client):
+def make_summarize_node(openai_client, temperature: float = 0):
     def summarize_node(state: "AgentState") -> "AgentState":
         user_query = state.get("user_query", "")
         status = state.get("counterfactual_status", "")
@@ -304,6 +411,7 @@ def make_summarize_node(openai_client):
                     {"role": "user", "content": f"User asked: {user_query}\n\nDetailed comparison:\n{comp}"},
                 ],
                 max_tokens=500,
+                temperature=temperature,
             )
             state["final_summary"] = (r.choices[0].message.content or comp).strip()
         elif status == "infeasible":
@@ -323,6 +431,7 @@ def make_summarize_node(openai_client):
                     {"role": "user", "content": f"User asked: {user_query}\n\nConflict analysis:\n{conflict}"},
                 ],
                 max_tokens=300,
+                temperature=temperature,
             )
             state["final_summary"] = (r.choices[0].message.content or conflict).strip()
         else:

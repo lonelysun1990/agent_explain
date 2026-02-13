@@ -14,6 +14,7 @@ from use_case.staffing_model.rag_config import StaffingGraphRAGConfig
 _ROOT = Path(__file__).resolve().parent
 STAFFING_DATA_DIR = _ROOT / "data"
 STAFFING_OUTPUTS_DIR = _ROOT / "outputs"
+STAFFING_QUERIES_PATH = _ROOT / "queries.json"
 
 __all__ = [
     "FORMULATION_DOCS",
@@ -24,4 +25,5 @@ __all__ = [
     "StaffingGraphRAGConfig",
     "STAFFING_DATA_DIR",
     "STAFFING_OUTPUTS_DIR",
+    "STAFFING_QUERIES_PATH",
 ]

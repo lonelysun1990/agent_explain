@@ -13,49 +13,111 @@ import gurobipy as gp
 from gurobipy import GRB
 
 
-def _parse_constraint_expression(expr: str, model: "gp.Model") -> dict[str, Any]:
-    """
-    Parse a simple constraint expression like 'x_ind[0,6,10] == 1' or 'd_miss[23,21] == 0',
-    add it to the model, and return a debug dict with details.
-
-    Returns
-    -------
-    dict with: expr, gurobi_var_name, forced_value, baseline_value, constraint_name
-    """
-    expr = expr.strip()
-    # Match: var_name[i,j,k] == value  or  var_name[i, j, k] == value
-    m = re.match(r"(\w+)\s*\[\s*([^\]]+)\s*\]\s*==\s*([\d.]+)", expr)
+def _resolve_rhs_value(rhs: str, inputs: dict[str, Any]) -> float:
+    """Resolve RHS to a number. rhs is either a numeric string or param[indices] (e.g. D[8,10])."""
+    rhs = rhs.strip()
+    try:
+        return float(rhs)
+    except ValueError:
+        pass
+    m = re.match(r"(\w+)\s*\[\s*([^\]]+)\s*\]", rhs)
     if not m:
-        raise ValueError(f"Cannot parse constraint expression: {expr}")
-    var_name = m.group(1)
-    indices_str = m.group(2)
-    value = float(m.group(3))
+        raise ValueError(f"Cannot resolve RHS as number or param[indices]: {rhs!r}")
+    param_name = m.group(1)
+    indices = [int(s.strip()) for s in m.group(2).split(",")]
+    # Map formulation param names to inputs keys (e.g. D -> demand array in staffing)
+    if param_name == "D":
+        arr = inputs.get("demand")
+    else:
+        arr = inputs.get(param_name) or inputs.get(param_name.lower())
+    if arr is None:
+        raise ValueError(f"Unknown parameter in inputs: {param_name!r}")
+    return float(arr[tuple(indices)])
 
-    indices = [int(s.strip()) for s in indices_str.split(",")]
+
+def _get_var_by_name(model: "gp.Model", var_name: str, indices: list[int]) -> "gp.Var":
     gurobi_var_name = f"{var_name}[{','.join(map(str, indices))}]"
     var = model.getVarByName(gurobi_var_name)
     if var is None:
-        # Fallback: Gurobi may not have name index until model.update(); search by VarName
         for v in model.getVars():
             if v.VarName == gurobi_var_name:
-                var = v
-                break
-    if var is None:
+                return v
         raise ValueError(f"Variable not found in model: {gurobi_var_name}")
+    return var
 
-    # Capture the variable's current bounds/start for debug context
-    constr_name = f"user_constr_{var_name}_{'_'.join(map(str, indices))}"
-    model.addConstr(var == value, name=constr_name)
 
-    return {
-        "expr": expr,
-        "gurobi_var_name": gurobi_var_name,
-        "forced_value": value,
-        "var_lb": var.LB,
-        "var_ub": var.UB,
-        "var_type": var.VType,
-        "constraint_name": constr_name,
-    }
+def _parse_constraint_expression(expr: str, model: "gp.Model", inputs: dict[str, Any]) -> dict[str, Any]:
+    """
+    Parse a constraint expression, add it to the model, and return a debug dict.
+
+    Accepts:
+      - var[indices] == number  or  var[indices] == param[indices]
+      - var[indices] >=/<= number  or  var[indices] >=/<= param[indices]
+      - sum of var[indices] (with +) >=/<=/== number  or  param[indices]
+    """
+    expr = expr.strip()
+
+    # --- Linear: lhs (sum of vars) >=/<=/== rhs (number or param[indices]) ---
+    m_linear = re.match(r"^(.+?)\s*(>=|<=|==)\s*([\d.]+|\w+\s*\[\s*[^\]]+\s*\])\s*$", expr)
+    if m_linear and "+" in expr:
+        lhs_str, op, rhs_str = m_linear.group(1), m_linear.group(2), m_linear.group(3).strip()
+        rhs_val = _resolve_rhs_value(rhs_str, inputs)
+        # Collect all var[indices] from lhs
+        terms = re.findall(r"(\w+)\s*\[\s*([^\]]+)\s*\]", lhs_str)
+        if not terms:
+            raise ValueError(f"No variable terms found in LHS: {expr!r}")
+        lin_expr = gp.LinExpr(0.0)
+        for var_name, indices_str in terms:
+            indices = [int(s.strip()) for s in indices_str.split(",")]
+            v = _get_var_by_name(model, var_name, indices)
+            lin_expr += v
+        constr_name = f"user_constr_linear_{len(model.getConstrs())}"
+        if op == ">=":
+            model.addConstr(lin_expr >= rhs_val, name=constr_name)
+        elif op == "<=":
+            model.addConstr(lin_expr <= rhs_val, name=constr_name)
+        else:
+            model.addConstr(lin_expr == rhs_val, name=constr_name)
+        return {
+            "expr": expr,
+            "gurobi_var_name": None,
+            "forced_value": rhs_val,
+            "constraint_name": constr_name,
+            "linear": True,
+        }
+
+    # --- Simple: single var op number or param ---
+    m_simple = re.match(
+        r"(\w+)\s*\[\s*([^\]]+)\s*\]\s*(==|>=|<=)\s*([\d.]+|\w+\s*\[\s*[^\]]+\s*\])\s*$",
+        expr,
+    )
+    if m_simple:
+        var_name = m_simple.group(1)
+        indices_str = m_simple.group(2)
+        op = m_simple.group(3)
+        rhs_str = m_simple.group(4).strip()
+        indices = [int(s.strip()) for s in indices_str.split(",")]
+        value = _resolve_rhs_value(rhs_str, inputs)
+        var = _get_var_by_name(model, var_name, indices)
+        gurobi_var_name = f"{var_name}[{','.join(map(str, indices))}]"
+        constr_name = f"user_constr_{var_name}_{'_'.join(map(str, indices))}"
+        if op == "==":
+            model.addConstr(var == value, name=constr_name)
+        elif op == ">=":
+            model.addConstr(var >= value, name=constr_name)
+        else:
+            model.addConstr(var <= value, name=constr_name)
+        return {
+            "expr": expr,
+            "gurobi_var_name": gurobi_var_name,
+            "forced_value": value,
+            "var_lb": var.LB,
+            "var_ub": var.UB,
+            "var_type": var.VType,
+            "constraint_name": constr_name,
+            "linear": False,
+        }
+    raise ValueError(f"Cannot parse constraint expression: {expr!r}")
 
 
 def run_counterfactual(
@@ -108,7 +170,7 @@ def run_counterfactual(
 
     try:
         for expr in constraint_expressions:
-            info = _parse_constraint_expression(expr, model)
+            info = _parse_constraint_expression(expr, model, inputs)
             result["applied_constraints"].append(info)
     except Exception as e:
         result["error"] = f"Failed to add constraint: {e}"
