@@ -25,6 +25,7 @@ build/
 
 # Generated outputs (large files)
 outputs/
+use_case/**/outputs/
 
 # IDE / editor
 .vscode/
